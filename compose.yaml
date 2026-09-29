@@ -1,0 +1,10 @@
+services:
+  txcheck:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: txcheck:local
+    # Mount the bundled example logs; pass /data/<name>.json as the argument
+    # or pipe a log on stdin with: docker compose run -T --rm txcheck < log.json
+    volumes:
+      - ./examples:/data:ro

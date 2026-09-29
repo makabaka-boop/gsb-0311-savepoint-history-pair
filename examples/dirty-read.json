@@ -1,0 +1,10 @@
+{
+  "transactions": ["T1", "T2"],
+  "ops": [
+    {"txn": "T1", "op": "WRITE", "key": "x", "value": 1},
+    {"txn": "T2", "op": "READ",  "key": "x"},
+    {"txn": "T2", "op": "WRITE", "key": "x", "value": 2},
+    {"txn": "T2", "op": "COMMIT"},
+    {"txn": "T1", "op": "ABORT"}
+  ]
+}
