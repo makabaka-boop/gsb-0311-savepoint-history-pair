@@ -1,0 +1,13 @@
+{
+  "transactions": ["A", "B"],
+  "ops": [
+    {"txn": "A", "op": "WRITE", "key": "x", "value": 1},
+    {"txn": "A", "op": "SAVEPOINT", "name": "sp"},
+    {"txn": "A", "op": "WRITE", "key": "x", "value": 9},
+    {"txn": "B", "op": "READ",  "key": "x"},
+    {"txn": "A", "op": "ROLLBACK", "name": "sp"},
+    {"txn": "B", "op": "READ",  "key": "x"},
+    {"txn": "A", "op": "COMMIT"},
+    {"txn": "B", "op": "COMMIT"}
+  ]
+}

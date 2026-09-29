@@ -59,7 +59,8 @@
 ```sh
 go build -o txcheck .
 ./txcheck examples/dirty-read.json     # 读文件
-./txcheck < examples/cycle.json        # 读 stdin
+./txcheck < examples/cycle.json        # 读 stdin 管道
+./txcheck examples/savepoint.json      # 保存点回退：读后重读、affectedReads 与可恢复性
 ```
 
 Compose 的 `txcheck` 服务（镜像构建时会先跑 `go vet` 和全部测试）：

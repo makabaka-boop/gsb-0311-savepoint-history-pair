@@ -9,6 +9,7 @@ package main
 
 import (
 	"encoding/json"
+	"fmt"
 	"math/rand"
 	"reflect"
 	"sort"
@@ -27,28 +28,131 @@ func refCommitSeq(l *Log) map[string]int {
 	return m
 }
 
-// refSourceOf returns the seq of the WRITE that is the source of the READ at
-// readSeq: the latest WRITE on the same key before it (whatever happened to
-// that write later), or false when the read sees the initial version.
-func refSourceOf(l *Log, readSeq int) (int, bool) {
+// refSavepointModels replays every SAVEPOINT/ROLLBACK independently of the
+// auditor and returns, per write/read op seq, the seq of the rollback that
+// invalidated it (0 when it stays effective), plus one expected Rollback
+// report entry per ROLLBACK op.
+//
+// Savepoint rules: a rollback undoes the rolling-back transaction's own
+// writes strictly after the target savepoint that are still alive, and
+// discards its own reads in the same range; later savepoints are lost while
+// the target stays effective and may be rolled back to again.
+type refRollbackModel struct {
+	undoneAt    map[int]int
+	discardedAt map[int]int
+	rollbacks   []Rollback
+}
+
+func refSavepointModels(l *Log) refRollbackModel {
+	m := refRollbackModel{
+		undoneAt:    map[int]int{},
+		discardedAt: map[int]int{},
+		rollbacks:   []Rollback{},
+	}
+	type sp struct {
+		seq  int
+		name string
+	}
+	stacks := map[string][]sp{}
+	// Alive writes per transaction (no undo yet), in log order.
+	aliveWrites := map[string][]int{}
+	var reads []int // read seqs in log order
+	for i := range l.Ops {
+		op := &l.Ops[i]
+		switch op.Type {
+		case OpRead:
+			reads = append(reads, op.Seq)
+		case OpWrite:
+			aliveWrites[op.Txn] = append(aliveWrites[op.Txn], op.Seq)
+		case OpSavepoint:
+			stacks[op.Txn] = append(stacks[op.Txn], sp{seq: op.Seq, name: op.Name})
+		case OpRollback:
+			entry := Rollback{
+				Seq:            op.Seq,
+				Txn:            op.Txn,
+				Name:           op.Name,
+				UndoneWrites:   []int{},
+				DiscardedReads: []int{},
+				AffectedReads:  []int{},
+			}
+			target := 0
+			for k, s := range stacks[op.Txn] {
+				if s.name == op.Name {
+					target = s.seq
+					stacks[op.Txn] = stacks[op.Txn][:k+1]
+					break
+				}
+			}
+			var keep []int
+			for _, ws := range aliveWrites[op.Txn] {
+				if ws > target {
+					m.undoneAt[ws] = op.Seq
+					entry.UndoneWrites = append(entry.UndoneWrites, ws)
+				} else {
+					keep = append(keep, ws)
+				}
+			}
+			aliveWrites[op.Txn] = keep
+
+			undoneSet := map[int]bool{}
+			for _, ws := range entry.UndoneWrites {
+				undoneSet[ws] = true
+			}
+			affected := map[int]bool{}
+			for _, rs := range reads {
+				if rs >= op.Seq {
+					break
+				}
+				r := l.Ops[rs-1]
+				if r.Txn == op.Txn {
+					if _, gone := m.discardedAt[rs]; !gone && rs > target {
+						m.discardedAt[rs] = op.Seq
+						entry.DiscardedReads = append(entry.DiscardedReads, rs)
+					}
+				}
+				if ws, ok := refSourceAt(l, rs, m.undoneAt); ok && undoneSet[ws] {
+					affected[rs] = true
+				}
+			}
+			for rs := range affected {
+				entry.AffectedReads = append(entry.AffectedReads, rs)
+			}
+			sort.Ints(entry.AffectedReads)
+			m.rollbacks = append(m.rollbacks, entry)
+		}
+	}
+	return m
+}
+
+// refSourceAt returns the seq of the WRITE that is the source of the READ at
+// readSeq: the latest WRITE on the same key before it which was effective at
+// that point (a write undone at or before readSeq is skipped; an aborted
+// transaction's write is not), or false when the read sees the initial
+// version.
+func refSourceAt(l *Log, readSeq int, undoneAt map[int]int) (int, bool) {
 	key := l.Ops[readSeq-1].Key
 	for j := readSeq - 1; j >= 1; j-- {
-		if l.Ops[j-1].Type == OpWrite && l.Ops[j-1].Key == key {
-			return j, true
+		if l.Ops[j-1].Type != OpWrite || l.Ops[j-1].Key != key {
+			continue
 		}
+		if at, ok := undoneAt[j]; ok && at <= readSeq {
+			continue
+		}
+		return j, true
 	}
 	return 0, false
 }
 
-// refReads recomputes every read fact by an independent backward scan.
-func refReads(l *Log) []ReadFact {
-	var out []ReadFact
+// refReads recomputes every read fact by an independent backward scan,
+// skipping writes undone before the read.
+func refReads(l *Log, undoneAt map[int]int) []ReadFact {
+	out := []ReadFact{}
 	for _, op := range l.Ops {
 		if op.Type != OpRead {
 			continue
 		}
 		f := ReadFact{Seq: op.Seq, Txn: op.Txn, Key: op.Key}
-		if ws, ok := refSourceOf(l, op.Seq); ok {
+		if ws, ok := refSourceAt(l, op.Seq, undoneAt); ok {
 			w := l.Ops[ws-1]
 			v := w.Value
 			f.Value = &v
@@ -59,6 +163,22 @@ func refReads(l *Log) []ReadFact {
 		out = append(out, f)
 	}
 	return out
+}
+
+// refLatestOtherWriteAt returns the latest effective WRITE on key at seq by
+// a transaction other than txn (undone writes skipped).
+func refLatestOtherWriteAt(l *Log, key, txn string, seq int, undoneAt map[int]int) (int, bool) {
+	for j := seq - 1; j >= 1; j-- {
+		o := l.Ops[j-1]
+		if o.Type != OpWrite || o.Key != key || o.Txn == txn {
+			continue
+		}
+		if at, ok := undoneAt[j]; ok && at <= seq {
+			continue
+		}
+		return j, true
+	}
+	return 0, false
 }
 
 // refEdges recomputes the conflict edges with a plain all-pairs loop.
@@ -164,8 +284,8 @@ func nextPerm(p []string) bool {
 
 // refFirstViolations recomputes the first violating op seq (0 = none) of
 // each property directly from the definitions, using a precomputed commit
-// table instead of the auditor's incremental scan.
-func refFirstViolations(l *Log) (recoverable, cascadeless, strict int) {
+// table and savepoint model instead of the auditor's incremental scan.
+func refFirstViolations(l *Log, sp refRollbackModel) (recoverable, cascadeless, strict int) {
 	commit := refCommitSeq(l)
 	committedBefore := func(txn string, seq int) bool {
 		c, ok := commit[txn]
@@ -174,25 +294,23 @@ func refFirstViolations(l *Log) (recoverable, cascadeless, strict int) {
 	for _, op := range l.Ops {
 		switch op.Type {
 		case OpRead:
-			if ws, ok := refSourceOf(l, op.Seq); ok {
+			if ws, ok := refSourceAt(l, op.Seq, sp.undoneAt); ok {
 				wt := l.Ops[ws-1].Txn
-				if wt != op.Txn && !committedBefore(wt, op.Seq) {
-					if cascadeless == 0 {
-						cascadeless = op.Seq
-					}
-					if strict == 0 {
-						strict = op.Seq
-					}
+				if wt != op.Txn && !committedBefore(wt, op.Seq) && cascadeless == 0 {
+					cascadeless = op.Seq
+				}
+			}
+			if ws, ok := refLatestOtherWriteAt(l, op.Key, op.Txn, op.Seq, sp.undoneAt); ok {
+				wt := l.Ops[ws-1].Txn
+				if !committedBefore(wt, op.Seq) && strict == 0 {
+					strict = op.Seq
 				}
 			}
 		case OpWrite:
-			for j := op.Seq - 1; j >= 1; j-- {
-				w := l.Ops[j-1]
-				if w.Type == OpWrite && w.Key == op.Key {
-					if w.Txn != op.Txn && !committedBefore(w.Txn, op.Seq) && strict == 0 {
-						strict = op.Seq
-					}
-					break
+			if ws, ok := refLatestOtherWriteAt(l, op.Key, op.Txn, op.Seq, sp.undoneAt); ok {
+				wt := l.Ops[ws-1].Txn
+				if !committedBefore(wt, op.Seq) && strict == 0 {
+					strict = op.Seq
 				}
 			}
 		case OpCommit:
@@ -204,11 +322,26 @@ func refFirstViolations(l *Log) (recoverable, cascadeless, strict int) {
 				if r.Txn != op.Txn || r.Type != OpRead {
 					continue
 				}
-				if ws, ok := refSourceOf(l, r.Seq); ok {
-					wt := l.Ops[ws-1].Txn
-					if wt != op.Txn && !committedBefore(wt, op.Seq) {
-						bad = true
-					}
+				// A read the reader itself discarded is no longer a commit
+				// dependency, even though the dirty read remains recorded.
+				if at, ok := sp.discardedAt[r.Seq]; ok && at < op.Seq {
+					continue
+				}
+				ws, ok := refSourceAt(l, r.Seq, sp.undoneAt)
+				if !ok {
+					continue
+				}
+				w := l.Ops[ws-1]
+				if w.Txn == op.Txn {
+					continue
+				}
+				if !committedBefore(w.Txn, op.Seq) {
+					bad = true
+					break
+				}
+				if at, gone := sp.undoneAt[ws]; gone && at < op.Seq {
+					bad = true
+					break
 				}
 			}
 			if bad && recoverable == 0 {
@@ -219,8 +352,28 @@ func refFirstViolations(l *Log) (recoverable, cascadeless, strict int) {
 	return recoverable, cascadeless, strict
 }
 
+// refFinalState applies all committed, not-undone writes in log order.
+func refFinalState(l *Log, sp refRollbackModel) map[string]int64 {
+	commit := refCommitSeq(l)
+	out := map[string]int64{}
+	for _, op := range l.Ops {
+		if op.Type != OpWrite {
+			continue
+		}
+		if _, ok := commit[op.Txn]; !ok {
+			continue
+		}
+		if _, gone := sp.undoneAt[op.Seq]; gone {
+			continue
+		}
+		out[op.Key] = op.Value
+	}
+	return out
+}
+
 // genLog builds a random valid log: 2..5 transactions (ids chosen to stress
-// byte ordering), up to 3 reads/writes each on 3 shared keys, one random
+// byte ordering), up to 3 reads/writes each on 3 shared keys interleaved
+// with savepoints and rollbacks to currently active savepoints, one random
 // terminator per transaction, all randomly interleaved.
 func genLog(r *rand.Rand) *Log {
 	ids := []string{"A", "B", "C", "D", "a", "b", "T1", "T10", "T2", "z"}
@@ -233,11 +386,34 @@ func genLog(r *rand.Rand) *Log {
 	keys := []string{"x", "y", "z"}
 	queues := make([][]Op, n)
 	for i := range queues {
+		// Local active-savepoint stack so generated logs are valid. Names
+		// are globally unique counters and may be reused only after the
+		// savepoint has been rolled back (popped).
+		var spStack []string
+		nextSP := 0
+		spName := func() string {
+			s := fmt.Sprintf("sp%d", nextSP)
+			nextSP++
+			return s
+		}
 		for k := 0; k < r.Intn(4); k++ {
+			// Occasionally open a savepoint.
+			if r.Intn(3) == 0 {
+				name := spName()
+				queues[i] = append(queues[i], Op{Txn: txns[i], Type: OpSavepoint, Name: name})
+				spStack = append(spStack, name)
+			}
 			if r.Intn(2) == 0 {
 				queues[i] = append(queues[i], Op{Txn: txns[i], Type: OpRead, Key: keys[r.Intn(len(keys))]})
 			} else {
 				queues[i] = append(queues[i], Op{Txn: txns[i], Type: OpWrite, Key: keys[r.Intn(len(keys))], Value: int64(r.Intn(10))})
+			}
+			// Occasionally roll back to the latest active savepoint (it
+			// survives and may be targeted again).
+			if len(spStack) > 0 && r.Intn(3) == 0 {
+				name := spStack[len(spStack)-1]
+				queues[i] = append(queues[i], Op{Txn: txns[i], Type: OpRollback, Name: name})
+				spStack = spStack[:len(spStack)-1]
 			}
 		}
 		term := OpCommit
@@ -281,11 +457,18 @@ func TestCrossCheckRandomLogs(t *testing.T) {
 			data, _ := json.Marshal(l)
 			t.Logf("seed %d log: %s", seed, data)
 		}
+		sp := refSavepointModels(l)
 
 		// 1. read sources
-		if want := refReads(l); !reflect.DeepEqual(rep.Reads, want) {
+		if want := refReads(l, sp.undoneAt); !reflect.DeepEqual(rep.Reads, want) {
 			prefix()
 			t.Fatalf("reads mismatch:\n got %+v\nwant %+v", rep.Reads, want)
+		}
+
+		// 1b. rollback reports
+		if want := sp.rollbacks; !reflect.DeepEqual(rep.Rollbacks, want) {
+			prefix()
+			t.Fatalf("rollbacks mismatch:\n got %+v\nwant %+v", rep.Rollbacks, want)
 		}
 
 		// 2. conflict edges
@@ -321,7 +504,7 @@ func TestCrossCheckRandomLogs(t *testing.T) {
 		}
 
 		// 4. the three properties
-		wantRec, wantCas, wantStr := refFirstViolations(l)
+		wantRec, wantCas, wantStr := refFirstViolations(l, sp)
 		if got := violSeq(rep.Recoverable); got != wantRec {
 			prefix()
 			t.Fatalf("recoverable first violation: got %d want %d", got, wantRec)
@@ -346,6 +529,12 @@ func TestCrossCheckRandomLogs(t *testing.T) {
 			rep.Strict.Violation.Op != OpRead && rep.Strict.Violation.Op != OpWrite {
 			prefix()
 			t.Fatalf("strict violation must be a READ or WRITE, got %+v", rep.Strict.Violation)
+		}
+
+		// 5. final state
+		if want := refFinalState(l, sp); !reflect.DeepEqual(rep.FinalState, want) {
+			prefix()
+			t.Fatalf("finalState mismatch: got %v want %v", rep.FinalState, want)
 		}
 	}
 }
