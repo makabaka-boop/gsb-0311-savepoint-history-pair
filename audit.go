@@ -13,12 +13,12 @@ import (
 type OpType string
 
 const (
-	OpRead   OpType = "READ"
-	OpWrite  OpType = "WRITE"
-	OpCommit OpType = "COMMIT"
-	OpAbort  OpType = "ABORT"
+	OpRead      OpType = "READ"
+	OpWrite     OpType = "WRITE"
+	OpCommit    OpType = "COMMIT"
+	OpAbort     OpType = "ABORT"
 	OpSavepoint OpType = "SAVEPOINT"
-	OpRollback OpType = "ROLLBACK"
+	OpRollback  OpType = "ROLLBACK"
 )
 
 // Op is a single logged operation. Seq is the 1-based position in the log,
@@ -30,7 +30,7 @@ type Op struct {
 	Type  OpType `json:"op"`
 	Key   string `json:"key,omitempty"`
 	Value int64  `json:"value,omitempty"`
-	Name string `json:"name,omitempty"`
+	Name  string `json:"name,omitempty"`
 }
 
 // Log is the audited input: 2..8 transactions and up to 500 ordered ops.
@@ -45,10 +45,37 @@ const (
 	maxOps  = 500
 )
 
+// activeSavepoint is one frame of a transaction's live savepoint stack.
+type activeSavepoint struct {
+	name string
+	seq  int
+}
+
+// validSavepointName reports whether s is 1..32 ASCII letters, digits,
+// underscores or hyphens.
+func validSavepointName(s string) bool {
+	if len(s) < 1 || len(s) > 32 {
+		return false
+	}
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		switch {
+		case c >= 'a' && c <= 'z', c >= 'A' && c <= 'Z',
+			c >= '0' && c <= '9', c == '_', c == '-':
+		default:
+			return false
+		}
+	}
+	return true
+}
+
 // ParseLog decodes a log from JSON and validates it:
 //   - 2..8 distinct, non-empty transaction ids;
 //   - 1..500 ops on declared transactions;
-//   - READ and WRITE carry a key, COMMIT and ABORT must not;
+//   - READ and WRITE carry a key; SAVEPOINT and ROLLBACK carry a 1..32 char
+//     ASCII name and no key; COMMIT and ABORT carry neither;
+//   - savepoint names are unique among a transaction's live savepoints, and
+//     ROLLBACK may only name a live savepoint of the same transaction;
 //   - every transaction has exactly one terminating COMMIT or ABORT and no
 //     operation of that transaction may appear after it.
 func ParseLog(data []byte) (*Log, error) {
@@ -78,6 +105,7 @@ func ParseLog(data []byte) (*Log, error) {
 		return nil, fmt.Errorf("ops: at most %d operations allowed, got %d", maxOps, len(l.Ops))
 	}
 	terminated := make(map[string]int, len(l.Txns)) // txn -> seq of its terminator
+	savepoints := make(map[string][]activeSavepoint, len(l.Txns))
 	for i := range l.Ops {
 		op := &l.Ops[i]
 		op.Seq = i + 1
@@ -89,19 +117,49 @@ func ParseLog(data []byte) (*Log, error) {
 			if op.Key == "" {
 				return nil, fmt.Errorf("op %d: %s requires a key", op.Seq, op.Type)
 			}
-		case OpSavepoint, OpRollback:
-			if op.Name == "" || op.Key != "" {
-				return nil, fmt.Errorf("op %d: savepoint operation requires name and no key", op.Seq)
+		case OpSavepoint:
+			if !validSavepointName(op.Name) || op.Key != "" {
+				return nil, fmt.Errorf("op %d: SAVEPOINT requires a 1..32 char name of ASCII letters, digits, '_' or '-' and no key", op.Seq)
+			}
+		case OpRollback:
+			if !validSavepointName(op.Name) || op.Key != "" {
+				return nil, fmt.Errorf("op %d: ROLLBACK requires a 1..32 char name of ASCII letters, digits, '_' or '-' and no key", op.Seq)
 			}
 		case OpCommit, OpAbort:
-			if op.Key != "" {
-				return nil, fmt.Errorf("op %d: %s must not carry a key", op.Seq, op.Type)
+			if op.Key != "" || op.Name != "" {
+				return nil, fmt.Errorf("op %d: %s must not carry a key or name", op.Seq, op.Type)
 			}
 		default:
-			return nil, fmt.Errorf("op %d: unknown op %q (want READ, WRITE, COMMIT or ABORT)", op.Seq, op.Type)
+			return nil, fmt.Errorf("op %d: unknown op %q (want READ, WRITE, SAVEPOINT, ROLLBACK, COMMIT or ABORT)", op.Seq, op.Type)
 		}
 		if t, ok := terminated[op.Txn]; ok {
 			return nil, fmt.Errorf("op %d: transaction %q already terminated at op %d", op.Seq, op.Txn, t)
+		}
+		// Savepoint well-formedness: names must not collide among this
+		// transaction's live savepoints, and a ROLLBACK must name one.
+		// Rolling back drops every later savepoint; the target survives and
+		// may be rolled back again.
+		switch op.Type {
+		case OpSavepoint:
+			for _, sp := range savepoints[op.Txn] {
+				if sp.name == op.Name {
+					return nil, fmt.Errorf("op %d: savepoint %q already exists in transaction %q", op.Seq, op.Name, op.Txn)
+				}
+			}
+			savepoints[op.Txn] = append(savepoints[op.Txn], activeSavepoint{name: op.Name, seq: op.Seq})
+		case OpRollback:
+			stack := savepoints[op.Txn]
+			idx := -1
+			for k, sp := range stack {
+				if sp.name == op.Name {
+					idx = k
+					break
+				}
+			}
+			if idx < 0 {
+				return nil, fmt.Errorf("op %d: no live savepoint %q in transaction %q", op.Seq, op.Name, op.Txn)
+			}
+			savepoints[op.Txn] = stack[:idx+1]
 		}
 		if op.Type == OpCommit || op.Type == OpAbort {
 			terminated[op.Txn] = op.Seq
@@ -134,6 +192,20 @@ type ReadFact struct {
 	Key    string `json:"key"`
 	Value  *int64 `json:"value,omitempty"`
 	Source Source `json:"source"`
+}
+
+// RollbackFact records one ROLLBACK: the writes of this transaction that
+// newly stop participating in later read selection (UndoneWrites), the reads
+// of this transaction newly discarded as commit dependencies
+// (DiscardedReads), and every historical READ that observed one of those
+// writes (AffectedReads), including reads later discarded by their reader.
+type RollbackFact struct {
+	Seq            int    `json:"seq"`
+	Txn            string `json:"txn"`
+	Name           string `json:"name"`
+	UndoneWrites   []int  `json:"undoneWrites"`
+	DiscardedReads []int  `json:"discardedReads"`
+	AffectedReads  []int  `json:"affectedReads"`
 }
 
 // Conflict is one ordered pair of conflicting ops (same key, different
@@ -183,6 +255,7 @@ type Report struct {
 	Transactions    []string         `json:"transactions"`
 	NumOps          int              `json:"numOps"`
 	Reads           []ReadFact       `json:"reads"`
+	Rollbacks       []RollbackFact   `json:"rollbacks"`
 	Edges           []Edge           `json:"edges"`
 	Serializability SerialResult     `json:"serializability"`
 	Recoverable     PropResult       `json:"recoverable"`
@@ -193,44 +266,88 @@ type Report struct {
 
 // ---------- audit ----------
 
+// spFrame holds the writes and reads a transaction performed after one of
+// its live savepoints. Rolling back to that savepoint undoes/discards them.
+type spFrame struct {
+	seq    int
+	writes []int
+	reads  []int
+}
+
 // Audit scans the log once in order and derives the full report.
 //
 // The properties are judged purely by log position, never by the final
 // state: a write becomes visible to other transactions only when its
 // transaction COMMITs, and an ABORT never erases a dirty read that already
-// happened.
+// happened. ROLLBACK TO SAVEPOINT is stronger: the writes it undoes stop
+// participating in later read-value selection (for everyone) and in commit
+// dependencies, and reads the reader rolls back stop being its commit
+// dependencies. The physical operations still took place, so they remain in
+// the read audit trail and in the conflict graph.
 func Audit(l *Log) *Report {
 	rep := &Report{
 		OK:           true,
 		Transactions: l.Txns,
 		NumOps:       len(l.Ops),
+		Reads:        []ReadFact{},
+		Rollbacks:    []RollbackFact{},
 		FinalState:   map[string]int64{},
 	}
 
 	committed := make(map[string]int, len(l.Txns)) // txn -> commit seq
-	lastWrite := make(map[string]int)              // key -> seq of latest WRITE
-	readsFrom := make(map[string]map[string][]int) // reader -> writer -> read seqs
+	undoneAt := make(map[int]int)                  // write seq -> seq of the ROLLBACK that undid it
+	discardedAt := make(map[int]int)               // read seq -> seq of the ROLLBACK that discarded it
+	frames := make(map[string][]spFrame, len(l.Txns))
 	var recV, casV, strV *Violation
+
+	// latestWriteOn returns the seq of the latest still-effective WRITE on
+	// key at the current position (beforeSeq): the writer's own savepoint
+	// rollback removes a write from visibility for every later read.
+	latestWriteOn := func(key string, beforeSeq int) (int, bool) {
+		for j := beforeSeq - 2; j >= 0; j-- {
+			w := &l.Ops[j]
+			if w.Type != OpWrite || w.Key != key {
+				continue
+			}
+			if s, ok := undoneAt[w.Seq]; ok && s < beforeSeq {
+				continue
+			}
+			return w.Seq, true
+		}
+		return 0, false
+	}
+	// latestForeignWriteOn is the strictness probe: the latest
+	// still-effective WRITE on the key by a different transaction.
+	latestForeignWriteOn := func(txn, key string, beforeSeq int) (int, bool) {
+		for j := beforeSeq - 2; j >= 0; j-- {
+			w := &l.Ops[j]
+			if w.Type != OpWrite || w.Key != key || w.Txn == txn {
+				continue
+			}
+			if s, ok := undoneAt[w.Seq]; ok && s < beforeSeq {
+				continue
+			}
+			return w.Seq, true
+		}
+		return 0, false
+	}
 
 	for i := range l.Ops {
 		op := &l.Ops[i]
 		switch op.Type {
 		case OpRead:
 			fact := ReadFact{Seq: op.Seq, Txn: op.Txn, Key: op.Key}
-			if ws, ok := lastWrite[op.Key]; ok {
+			if ws, ok := latestWriteOn(op.Key, op.Seq); ok {
 				w := &l.Ops[ws-1]
 				v := w.Value
 				fact.Value = &v
 				fact.Source = Source{Kind: "write", Seq: w.Seq, Txn: w.Txn, Value: &v}
 				if w.Txn != op.Txn {
-					if readsFrom[op.Txn] == nil {
-						readsFrom[op.Txn] = map[string][]int{}
-					}
-					readsFrom[op.Txn][w.Txn] = append(readsFrom[op.Txn][w.Txn], op.Seq)
 					if _, ok := committed[w.Txn]; !ok {
 						// The source write is uncommitted: its transaction is
 						// still active or already aborted (an abort does not
-						// cleanse the write).
+						// cleanse the write). A later savepoint rollback by
+						// the reader does not erase this dirty read either.
 						if casV == nil {
 							casV = &Violation{Seq: op.Seq, Txn: op.Txn, Op: op.Type, Key: op.Key,
 								Reason: fmt.Sprintf("reads uncommitted write of transaction %s (op %d)", w.Txn, w.Seq)}
@@ -244,32 +361,122 @@ func Audit(l *Log) *Report {
 			} else {
 				fact.Source = Source{Kind: "initial"}
 			}
-			rep.Reads = append(rep.Reads, fact)
-		case OpWrite:
-			if ws, ok := lastWrite[op.Key]; ok {
-				w := &l.Ops[ws-1]
-				if w.Txn != op.Txn {
-					if _, ok := committed[w.Txn]; !ok && strV == nil {
+			// Strict is defined on the latest foreign write even when this
+			// read's own source is an earlier write of the reader.
+			if strV == nil {
+				if ws, ok := latestForeignWriteOn(op.Txn, op.Key, op.Seq); ok {
+					w := &l.Ops[ws-1]
+					if _, ok := committed[w.Txn]; !ok {
 						strV = &Violation{Seq: op.Seq, Txn: op.Txn, Op: op.Type, Key: op.Key,
-							Reason: fmt.Sprintf("overwrites uncommitted write of transaction %s (op %d)", w.Txn, w.Seq)}
+							Reason: fmt.Sprintf("reads uncommitted write of transaction %s (op %d)", w.Txn, w.Seq)}
 					}
 				}
 			}
-			lastWrite[op.Key] = op.Seq
-		case OpCommit:
-			// Recoverable: every transaction this one has read from must
-			// already be committed. If a source aborted or is still active,
-			// committing now is the first recoverability violation.
-			if recV == nil {
-				writers := make([]string, 0, len(readsFrom[op.Txn]))
-				for wt := range readsFrom[op.Txn] {
-					writers = append(writers, wt)
+			rep.Reads = append(rep.Reads, fact)
+			if st := frames[op.Txn]; len(st) > 0 {
+				st[len(st)-1].reads = append(st[len(st)-1].reads, op.Seq)
+				frames[op.Txn] = st
+			}
+		case OpWrite:
+			// Strict: the most recent write of another transaction on this
+			// key must already be committed (and not rolled back).
+			if ws, ok := latestForeignWriteOn(op.Txn, op.Key, op.Seq); ok {
+				w := &l.Ops[ws-1]
+				if _, ok := committed[w.Txn]; !ok && strV == nil {
+					strV = &Violation{Seq: op.Seq, Txn: op.Txn, Op: op.Type, Key: op.Key,
+						Reason: fmt.Sprintf("overwrites uncommitted write of transaction %s (op %d)", w.Txn, w.Seq)}
 				}
-				sort.Strings(writers)
-				for _, wt := range writers {
-					if _, ok := committed[wt]; !ok {
+			}
+			if st := frames[op.Txn]; len(st) > 0 {
+				st[len(st)-1].writes = append(st[len(st)-1].writes, op.Seq)
+				frames[op.Txn] = st
+			}
+		case OpSavepoint:
+			frames[op.Txn] = append(frames[op.Txn], spFrame{seq: op.Seq})
+		case OpRollback:
+			stack := frames[op.Txn]
+			// The parser already verified the named savepoint is live; find
+			// the frame it opened (the stack index matches savepoint order).
+			idx := len(stack) - 1
+			for k := range stack {
+				if l.Ops[stack[k].seq-1].Name == op.Name {
+					idx = k
+					break
+				}
+			}
+			var undone, discarded []int
+			for k := idx; k < len(stack); k++ {
+				undone = append(undone, stack[k].writes...)
+				discarded = append(discarded, stack[k].reads...)
+			}
+			// Operations of the target frame were performed strictly after
+			// the target savepoint; dropping them and keeping an empty target
+			// frame lets the same savepoint be rolled back again.
+			target := spFrame{seq: stack[idx].seq}
+			frames[op.Txn] = append(stack[:idx:idx], target)
+			for _, ws := range undone {
+				undoneAt[ws] = op.Seq
+			}
+			for _, rs := range discarded {
+				discardedAt[rs] = op.Seq
+			}
+			sort.Ints(undone)
+			sort.Ints(discarded)
+			if undone == nil {
+				undone = []int{}
+			}
+			if discarded == nil {
+				discarded = []int{}
+			}
+			// affectedReads: every READ before this ROLLBACK whose source
+			// was one of the writes undone now — including reads already
+			// discarded by their own reader and reads by this transaction.
+			undoneSet := make(map[int]bool, len(undone))
+			for _, ws := range undone {
+				undoneSet[ws] = true
+			}
+			affected := []int{}
+			for _, f := range rep.Reads {
+				if f.Seq >= op.Seq {
+					break
+				}
+				if f.Source.Kind == "write" && undoneSet[f.Source.Seq] {
+					affected = append(affected, f.Seq)
+				}
+			}
+			rep.Rollbacks = append(rep.Rollbacks, RollbackFact{
+				Seq:            op.Seq,
+				Txn:            op.Txn,
+				Name:           op.Name,
+				UndoneWrites:   undone,
+				DiscardedReads: discarded,
+				AffectedReads:  affected,
+			})
+		case OpCommit:
+			// Recoverable: every read this transaction kept (did not roll
+			// back itself) must come from a committed transaction whose
+			// write has not been rolled back to a savepoint. Readers that
+			// discarded their dirty read commit cleanly; readers keeping a
+			// read of a write later undone do not.
+			if recV == nil {
+				for _, f := range rep.Reads {
+					if f.Txn != op.Txn || f.Seq > op.Seq {
+						continue
+					}
+					if _, gone := discardedAt[f.Seq]; gone {
+						continue
+					}
+					if f.Source.Kind != "write" || f.Source.Txn == op.Txn {
+						continue
+					}
+					if s, undone := undoneAt[f.Source.Seq]; undone && s < op.Seq {
 						recV = &Violation{Seq: op.Seq, Txn: op.Txn, Op: op.Type,
-							Reason: fmt.Sprintf("commits before its source transaction %s (read at op %d) has committed", wt, readsFrom[op.Txn][wt][0])}
+							Reason: fmt.Sprintf("commits while a retained read (op %d) depends on rolled-back write of transaction %s (op %d)", f.Seq, f.Source.Txn, f.Source.Seq)}
+						break
+					}
+					if _, ok := committed[f.Source.Txn]; !ok {
+						recV = &Violation{Seq: op.Seq, Txn: op.Txn, Op: op.Type,
+							Reason: fmt.Sprintf("commits before its source transaction %s (read at op %d) has committed", f.Source.Txn, f.Seq)}
 						break
 					}
 				}
@@ -287,16 +494,21 @@ func Audit(l *Log) *Report {
 	rep.Cascadeless = PropResult{OK: casV == nil, Violation: casV}
 	rep.Strict = PropResult{OK: strV == nil, Violation: strV}
 
-	// Final committed state: writes of committed transactions, in log order.
-	// Shown for contrast only — it can look perfectly correct while the
-	// properties above are violated.
+	// Final committed state: writes of committed transactions that survived
+	// savepoint rollback, applied in log order. Shown for contrast only — it
+	// can look perfectly correct while the properties above are violated.
 	for i := range l.Ops {
 		op := &l.Ops[i]
-		if op.Type == OpWrite {
-			if _, ok := committed[op.Txn]; ok {
-				rep.FinalState[op.Key] = op.Value
-			}
+		if op.Type != OpWrite {
+			continue
 		}
+		if _, ok := committed[op.Txn]; !ok {
+			continue
+		}
+		if _, ok := undoneAt[op.Seq]; ok {
+			continue
+		}
+		rep.FinalState[op.Key] = op.Value
 	}
 	return rep
 }

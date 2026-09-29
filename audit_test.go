@@ -1,6 +1,7 @@
 package main
 
 import (
+	"fmt"
 	"strings"
 	"testing"
 )
@@ -300,6 +301,278 @@ func TestSerialOrderLexicographicallySmallest(t *testing.T) {
 	}
 }
 
+// The headline scenario: A writes x=1, savepoint, writes x=9; B reads 9
+// before A rolls back to the savepoint; B reads again; both commit. The
+// second read must see 1 again, the rollback lists op 3 with op 4 as the
+// affected read, B's commit violates recoverability (it kept the read of
+// the undone 9), and the final state is x=1 — not 9.
+func TestSavepointRollbackChangesReadSource(t *testing.T) {
+	rep := auditJSON(t, `{
+	  "transactions": ["A", "B"],
+	  "ops": [
+	    {"txn": "A", "op": "WRITE", "key": "x", "value": 1},
+	    {"txn": "A", "op": "SAVEPOINT", "name": "sp1"},
+	    {"txn": "A", "op": "WRITE", "key": "x", "value": 9},
+	    {"txn": "B", "op": "READ",  "key": "x"},
+	    {"txn": "A", "op": "ROLLBACK", "name": "sp1"},
+	    {"txn": "B", "op": "READ",  "key": "x"},
+	    {"txn": "A", "op": "COMMIT"},
+	    {"txn": "B", "op": "COMMIT"}
+	  ]
+	}`)
+
+	if src := readSource(t, rep, 4); src.Kind != "write" || src.Seq != 3 || src.Txn != "A" || *src.Value != 9 {
+		t.Fatalf("read@4 source = %+v, want write A@3 value 9", src)
+	}
+	if src := readSource(t, rep, 6); src.Kind != "write" || src.Seq != 1 || src.Txn != "A" || *src.Value != 1 {
+		t.Fatalf("read@6 source = %+v, want write A@1 value 1 (undone 9 no longer selectable)", src)
+	}
+	if len(rep.Rollbacks) != 1 {
+		t.Fatalf("rollbacks = %+v, want one entry", rep.Rollbacks)
+	}
+	rb := rep.Rollbacks[0]
+	if got := strings.Join(intsToStrings(rb.UndoneWrites), ","); got != "3" {
+		t.Fatalf("undoneWrites = %v, want [3]", rb.UndoneWrites)
+	}
+	if len(rb.DiscardedReads) != 0 {
+		t.Fatalf("discardedReads = %v, want empty (A did no reads)", rb.DiscardedReads)
+	}
+	if got := strings.Join(intsToStrings(rb.AffectedReads), ","); got != "4" {
+		t.Fatalf("affectedReads = %v, want [4] (B read the undone 9 before the rollback)", rb.AffectedReads)
+	}
+	if got := violSeq(rep.Recoverable); got != 8 {
+		t.Fatalf("recoverable violation seq = %d, want 8 (retained read of rolled-back write)", got)
+	}
+	if got := violSeq(rep.Cascadeless); got != 4 {
+		t.Fatalf("cascadeless violation seq = %d, want 4", got)
+	}
+	if got := violSeq(rep.Strict); got != 4 {
+		t.Fatalf("strict violation seq = %d, want 4", got)
+	}
+	if len(rep.FinalState) != 1 || rep.FinalState["x"] != 1 {
+		t.Fatalf("finalState = %v, want {x:1}", rep.FinalState)
+	}
+}
+
+// A reader that itself rolls back the dirty read commits cleanly: the
+// discarded read is absent from its commit dependencies, but it still
+// happened, so cascadeless/strict flag it and it is listed both as a
+// discarded read (of B) and an affected read (of A's rollback).
+func TestReaderDiscardsOwnDirtyRead(t *testing.T) {
+	rep := auditJSON(t, `{
+	  "transactions": ["A", "B"],
+	  "ops": [
+	    {"txn": "A", "op": "WRITE", "key": "x", "value": 1},
+	    {"txn": "A", "op": "SAVEPOINT", "name": "sp"},
+	    {"txn": "A", "op": "WRITE", "key": "x", "value": 9},
+	    {"txn": "B", "op": "SAVEPOINT", "name": "b"},
+	    {"txn": "B", "op": "READ",  "key": "x"},
+	    {"txn": "A", "op": "ROLLBACK", "name": "sp"},
+	    {"txn": "B", "op": "ROLLBACK", "name": "b"},
+	    {"txn": "B", "op": "READ",  "key": "x"},
+	    {"txn": "A", "op": "COMMIT"},
+	    {"txn": "B", "op": "COMMIT"}
+	  ]
+	}`)
+
+	if src := readSource(t, rep, 5); src.Seq != 3 {
+		t.Fatalf("read@5 source = %+v, want A@3 (9, before A rolled back)", src)
+	}
+	if src := readSource(t, rep, 8); src.Seq != 1 {
+		t.Fatalf("read@8 source = %+v, want A@1 (1, after rollback)", src)
+	}
+	if len(rep.Rollbacks) != 2 {
+		t.Fatalf("rollbacks = %+v, want two entries", rep.Rollbacks)
+	}
+	a, b := rep.Rollbacks[0], rep.Rollbacks[1]
+	if got := intsToStrings(a.UndoneWrites); strings.Join(got, ",") != "3" ||
+		strings.Join(intsToStrings(a.DiscardedReads), ",") != "" ||
+		strings.Join(intsToStrings(a.AffectedReads), ",") != "5" {
+		t.Fatalf("A rollback fact = %+v, want undone[3] discarded[] affected[5]", a)
+	}
+	if strings.Join(intsToStrings(b.UndoneWrites), ",") != "" ||
+		strings.Join(intsToStrings(b.DiscardedReads), ",") != "5" ||
+		strings.Join(intsToStrings(b.AffectedReads), ",") != "" {
+		t.Fatalf("B rollback fact = %+v, want undone[] discarded[5] affected[]", b)
+	}
+	if !rep.Recoverable.OK {
+		t.Fatalf("recoverable should hold: B discarded the dirty read, %+v", rep.Recoverable.Violation)
+	}
+	if got := violSeq(rep.Cascadeless); got != 5 {
+		t.Fatalf("cascadeless violation seq = %d, want 5 (dirty read still happened)", got)
+	}
+	if got := violSeq(rep.Strict); got != 5 {
+		t.Fatalf("strict violation seq = %d, want 5", got)
+	}
+	if rep.FinalState["x"] != 1 {
+		t.Fatalf("finalState[x] = %v, want 1", rep.FinalState["x"])
+	}
+}
+
+// Nested savepoints: rolling back to the outermost savepoint undoes writes
+// of every frame above it (ops 3 and 7) and discards the intervening read;
+// the report must not double-list a write on a later inner rollback.
+func TestNestedSavepointRollback(t *testing.T) {
+	rep := auditJSON(t, `{
+	  "transactions": ["T1", "T2"],
+	  "ops": [
+	    {"txn": "T1", "op": "WRITE", "key": "x", "value": 1},
+	    {"txn": "T1", "op": "SAVEPOINT", "name": "outer"},
+	    {"txn": "T1", "op": "WRITE", "key": "x", "value": 2},
+	    {"txn": "T1", "op": "READ",  "key": "x"},
+	    {"txn": "T1", "op": "SAVEPOINT", "name": "inner"},
+	    {"txn": "T1", "op": "WRITE", "key": "x", "value": 3},
+	    {"txn": "T1", "op": "ROLLBACK", "name": "inner"},
+	    {"txn": "T1", "op": "ROLLBACK", "name": "outer"},
+	    {"txn": "T2", "op": "READ",  "key": "x"},
+	    {"txn": "T1", "op": "COMMIT"},
+	    {"txn": "T2", "op": "COMMIT"}
+	  ]
+	}`)
+
+	if len(rep.Rollbacks) != 2 {
+		t.Fatalf("rollbacks = %+v, want two entries", rep.Rollbacks)
+	}
+	inner, outer := rep.Rollbacks[0], rep.Rollbacks[1]
+	if got := strings.Join(intsToStrings(inner.UndoneWrites), ","); got != "6" {
+		t.Fatalf("inner undoneWrites = %v, want [6]", inner.UndoneWrites)
+	}
+	if got := strings.Join(intsToStrings(outer.UndoneWrites), ","); got != "3" {
+		t.Fatalf("outer undoneWrites = %v, want [3] only (op 6 already undone)", outer.UndoneWrites)
+	}
+	if got := strings.Join(intsToStrings(outer.DiscardedReads), ","); got != "4" {
+		t.Fatalf("outer discardedReads = %v, want [4]", outer.DiscardedReads)
+	}
+	if src := readSource(t, rep, 9); src.Seq != 1 || *src.Value != 1 {
+		t.Fatalf("read@9 source = %+v, want T1@1 value 1 (ops 3,6 undone)", src)
+	}
+	if rep.FinalState["x"] != 1 {
+		t.Fatalf("finalState[x] = %v, want 1", rep.FinalState["x"])
+	}
+	if !rep.Recoverable.OK {
+		t.Fatalf("recoverable should hold: op 4 self-read was discarded, %+v", rep.Recoverable.Violation)
+	}
+}
+
+// Rolling back to an earlier savepoint must not undo writes performed
+// before that savepoint, and the named savepoint survives and can be
+// rolled back again later.
+func TestRollbackToEarlierSavepointKeepsOlderWrites(t *testing.T) {
+	rep := auditJSON(t, `{
+	  "transactions": ["T1", "T2"],
+	  "ops": [
+	    {"txn": "T1", "op": "WRITE", "key": "x", "value": 1},
+	    {"txn": "T1", "op": "SAVEPOINT", "name": "a"},
+	    {"txn": "T1", "op": "WRITE", "key": "x", "value": 2},
+	    {"txn": "T1", "op": "SAVEPOINT", "name": "b"},
+	    {"txn": "T1", "op": "WRITE", "key": "x", "value": 3},
+	    {"txn": "T1", "op": "ROLLBACK", "name": "a"},
+	    {"txn": "T2", "op": "READ",  "key": "x"},
+	    {"txn": "T1", "op": "SAVEPOINT", "name": "c"},
+	    {"txn": "T1", "op": "WRITE", "key": "x", "value": 4},
+	    {"txn": "T1", "op": "ROLLBACK", "name": "a"},
+	    {"txn": "T2", "op": "READ",  "key": "x"},
+	    {"txn": "T1", "op": "COMMIT"},
+	    {"txn": "T2", "op": "COMMIT"}
+	  ]
+	}`)
+
+	if len(rep.Rollbacks) != 2 {
+		t.Fatalf("rollbacks = %+v, want two entries", rep.Rollbacks)
+	}
+	first, second := rep.Rollbacks[0], rep.Rollbacks[1]
+	if got := strings.Join(intsToStrings(first.UndoneWrites), ","); got != "3,5" {
+		t.Fatalf("first undoneWrites = %v, want [3 5] (op 1 predates savepoint a)", first.UndoneWrites)
+	}
+	if got := strings.Join(intsToStrings(second.UndoneWrites), ","); got != "9" {
+		t.Fatalf("second undoneWrites = %v, want [9] (a survived and rolled back again)", second.UndoneWrites)
+	}
+	if src := readSource(t, rep, 7); src.Seq != 1 || *src.Value != 1 {
+		t.Fatalf("read@7 source = %+v, want T1@1 value 1", src)
+	}
+	if src := readSource(t, rep, 11); src.Seq != 1 || *src.Value != 1 {
+		t.Fatalf("read@11 source = %+v, want T1@1 value 1 (op 9 undone too)", src)
+	}
+	if rep.FinalState["x"] != 1 {
+		t.Fatalf("finalState[x] = %v, want 1", rep.FinalState["x"])
+	}
+}
+
+// Interleaving writes of A and B around A's savepoint rollback: the later
+// B read must skip the undone A write and select B's own surviving write.
+func TestInterleavedWritesAroundRollback(t *testing.T) {
+	rep := auditJSON(t, `{
+	  "transactions": ["A", "B"],
+	  "ops": [
+	    {"txn": "A", "op": "WRITE", "key": "x", "value": 1},
+	    {"txn": "A", "op": "SAVEPOINT", "name": "sp"},
+	    {"txn": "A", "op": "WRITE", "key": "x", "value": 9},
+	    {"txn": "B", "op": "WRITE", "key": "x", "value": 2},
+	    {"txn": "B", "op": "READ",  "key": "x"},
+	    {"txn": "A", "op": "ROLLBACK", "name": "sp"},
+	    {"txn": "B", "op": "READ",  "key": "x"},
+	    {"txn": "A", "op": "COMMIT"},
+	    {"txn": "B", "op": "COMMIT"}
+	  ]
+	}`)
+
+	if src := readSource(t, rep, 5); src.Seq != 4 || *src.Value != 2 {
+		t.Fatalf("read@5 source = %+v, want B@4 value 2 (self read)", src)
+	}
+	if src := readSource(t, rep, 7); src.Seq != 4 || *src.Value != 2 {
+		t.Fatalf("read@7 source = %+v, want B@4 value 2 (undone A@3 skipped)", src)
+	}
+	rb := rep.Rollbacks[0]
+	if strings.Join(intsToStrings(rb.UndoneWrites), ",") != "3" {
+		t.Fatalf("undoneWrites = %v, want [3]", rb.UndoneWrites)
+	}
+	// No read ever observed the undone write (B's reads both see B@4).
+	if len(rb.AffectedReads) != 0 {
+		t.Fatalf("affectedReads = %v, want empty", rb.AffectedReads)
+	}
+	// B@4 blind-overwrites A's uncommitted 9: strict fails at op 4.
+	if got := violSeq(rep.Strict); got != 4 {
+		t.Fatalf("strict violation seq = %d, want 4", got)
+	}
+	if !rep.Cascadeless.OK {
+		t.Fatalf("cascadeless should hold (no foreign read at all), %+v", rep.Cascadeless.Violation)
+	}
+	if !rep.Recoverable.OK {
+		t.Fatalf("recoverable should hold, %+v", rep.Recoverable.Violation)
+	}
+	if rep.FinalState["x"] != 2 {
+		t.Fatalf("finalState[x] = %v, want 2 (A@3 undone, B@4 committed)", rep.FinalState["x"])
+	}
+}
+
+// intsToStrings is a tiny helper for readable slice assertions.
+func intsToStrings(xs []int) []string {
+	out := make([]string, len(xs))
+	for i, x := range xs {
+		out[i] = fmt.Sprint(x)
+	}
+	return out
+}
+
+// A name released by rolling back later savepoints (and by the implicit
+// release at transaction end) may be reused; the parser must accept it.
+func TestSavepointNameReuseAfterRollback(t *testing.T) {
+	rep := auditJSON(t, `{
+	  "transactions": ["T1", "T2"],
+	  "ops": [
+	    {"txn": "T1", "op": "SAVEPOINT", "name": "a"},
+	    {"txn": "T1", "op": "SAVEPOINT", "name": "b"},
+	    {"txn": "T1", "op": "ROLLBACK", "name": "a"},
+	    {"txn": "T1", "op": "SAVEPOINT", "name": "b"},
+	    {"txn": "T1", "op": "COMMIT"},
+	    {"txn": "T2", "op": "COMMIT"}
+	  ]
+	}`)
+	if len(rep.Rollbacks) != 1 {
+		t.Fatalf("rollbacks = %+v, want one", rep.Rollbacks)
+	}
+}
+
 func TestParseValidation(t *testing.T) {
 	cases := []struct {
 		name, in, wantErr string
@@ -325,6 +598,22 @@ func TestParseValidation(t *testing.T) {
 		{"missing terminator", `{"transactions":["T1","T2"],"ops":[
 			{"txn":"T1","op":"COMMIT"},
 			{"txn":"T2","op":"READ","key":"x"}]}`, "never terminates"},
+		{"duplicate savepoint", `{"transactions":["T1","T2"],"ops":[
+			{"txn":"T1","op":"SAVEPOINT","name":"s"},
+			{"txn":"T1","op":"SAVEPOINT","name":"s"},
+			{"txn":"T1","op":"COMMIT"},
+			{"txn":"T2","op":"COMMIT"}]}`, "already exists"},
+		{"rollback unknown savepoint", `{"transactions":["T1","T2"],"ops":[
+			{"txn":"T1","op":"ROLLBACK","name":"s"},
+			{"txn":"T1","op":"COMMIT"},
+			{"txn":"T2","op":"COMMIT"}]}`, "no live savepoint"},
+		{"bad savepoint name", `{"transactions":["T1","T2"],"ops":[
+			{"txn":"T1","op":"SAVEPOINT","name":"bad name!"},
+			{"txn":"T1","op":"COMMIT"},
+			{"txn":"T2","op":"COMMIT"}]}`, "requires a 1..32 char name"},
+		{"commit with name", `{"transactions":["T1","T2"],"ops":[
+			{"txn":"T1","op":"COMMIT","name":"x"},
+			{"txn":"T2","op":"COMMIT"}]}`, "must not carry a key or name"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
